@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpSec for Dummies — Practical personal security</title>
+  <meta name="description" content="Learn how to protect your personal information, devices, accounts, and digital identity with plain-language lessons and hands-on security labs.">
+  <meta name="theme-color" content="#0a0e17">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/css/styles.css">
+  <link rel="modulepreload" href="/js/app.js">
+</head>
+<body>
+  <a class="skip-link" href="#app">Skip to content</a>
+  <header class="site-header">
+    <nav class="nav" aria-label="Main">
+      <a class="brand" href="#/">
+        <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 4v6c0 5-3.5 9-8 10-4.5-1-8-5-8-10V6l8-4z"/><rect x="9" y="11" width="6" height="5" rx="1"/><path d="M10 11V9.5a2 2 0 014 0V11"/></svg>
+        <span>OpSec <em>for Dummies</em></span>
+      </a>
+      <button class="nav-toggle" id="nav-toggle" aria-controls="nav-links" aria-expanded="false" aria-label="Toggle menu">
+        <span></span><span></span><span></span>
+      </button>
+      <div class="nav-links" id="nav-links">
+        <a href="#/dashboard" id="nav-dashboard" data-match="#/dashboard" hidden>Dashboard</a>
+        <a href="#/labs" data-match="#/labs">Labs</a>
+        <a href="#/reference" data-match="#/reference">Reference</a>
+        <a href="#/admin" id="nav-admin" data-match="#/admin" class="nav-admin" hidden>Admin Portal</a>
+        <span class="nav-user" id="nav-user" hidden></span>
+        <span class="badge admin" id="nav-role" hidden>admin</span>
+        <a href="#/auth/signin" id="nav-signin" class="btn small primary">Sign in</a>
+        <button id="nav-signout" class="btn small" hidden>Sign out</button>
+      </div>
+    </nav>
+  </header>
+
+  <main id="app" tabindex="-1">
+    <div class="loading" aria-live="polite"><div class="spinner"></div><p>Loading secure session…</p></div>
+  </main>
+
+  <footer class="site-footer">
+    <p>OpSec for Dummies is an educational project focused on personal, defensive security. Lessons are general guidance, not professional or legal advice.</p>
+    <p>All labs run in your browser. Simulated emails and websites are fictional and use reserved <code>.example</code> domains.</p>
+  </footer>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

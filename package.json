@@ -1,0 +1,16 @@
+{
+  "name": "opsec-for-dummies",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpSec for Dummies — an educational personal security web app on Vercel + Supabase",
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build:schema": "node scripts/build-schema.mjs",
+    "dev": "vercel dev",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  }
+}
