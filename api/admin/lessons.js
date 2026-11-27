@@ -1,4 +1,5 @@
 // /api/admin/lessons
+//   GET    ?module_id=                                                      → full lessons, with answer keys
 //   POST   { module_id, lesson_order, title, what_is_it, ..., quiz_json }   → create
 //   PUT    { id, ...fields }  (or ?id=)                                     → update
 //   DELETE ?id=  (or { id })                                                 → delete
@@ -21,6 +22,15 @@ async function ensureModule(db, moduleId) {
 }
 
 export default route({
+  // Full lessons including quiz answer keys, which browsers can't read directly.
+  async GET(req, res) {
+    const { db } = await requireAdmin(req);
+    const moduleId = validateId(req.query?.module_id, 'module_id');
+    const { data, error } = await db.from('lessons').select(COLUMNS).eq('module_id', moduleId).order('lesson_order');
+    if (error) throw dbError(error);
+    send(res, 200, { lessons: data });
+  },
+
   async POST(req, res) {
     const { db } = await requireAdmin(req);
     const lesson = validateLesson(readBody(req));

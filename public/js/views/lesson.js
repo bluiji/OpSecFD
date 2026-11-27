@@ -1,9 +1,11 @@
-// Lesson page: six-part format + interactive quiz that upserts into user_progress.
-import { getSupabase } from '../supabaseClient.js';
-import { state, loadCurriculum } from '../state.js';
+// Lesson page: six-part format + interactive quiz.
+// The browser only gets questions and options (public.lesson_quiz). Answers are
+// graded, and progress saved, by /api/quiz/submit on the server.
+import { getSupabase, apiFetch } from '../supabaseClient.js';
+import { state, loadCurriculum, needsBaseline, courseComplete } from '../state.js';
 import { $, $$, esc, richText, toast, icons } from '../utils.js';
 
-export const PASS_MARK = 60; // percent needed to mark a lesson complete
+const LESSON_COLUMNS = 'id, module_id, lesson_order, title, what_is_it, why_it_matters, how_it_works, real_world_scenario, how_to_protect';
 
 const SECTIONS = [
   ['what_is_it', 'What is it?'],
@@ -16,11 +18,13 @@ const SECTIONS = [
 export async function renderLesson(app, lessonId) {
   app.innerHTML = `<div class="loading"><div class="spinner"></div><p>Loading lesson…</p></div>`;
   const supabase = await getSupabase();
-  const [, res] = await Promise.all([
+  const [, res, quizRes] = await Promise.all([
     loadCurriculum(),
-    supabase.from('lessons').select('*').eq('id', lessonId).maybeSingle()
+    supabase.from('lessons').select(LESSON_COLUMNS).eq('id', lessonId).maybeSingle(),
+    supabase.rpc('lesson_quiz', { p_lesson_id: lessonId })
   ]);
   if (res.error) throw res.error;
+  if (quizRes.error) throw quizRes.error;
   const lesson = res.data;
   if (!lesson) {
     app.innerHTML = `<section class="card narrow"><h1>Lesson not found</h1><a class="btn" href="#/dashboard">Back to dashboard</a></section>`;
@@ -31,13 +35,19 @@ export async function renderLesson(app, lessonId) {
   const siblings = mod?.lessons || [];
   const idx = siblings.findIndex((l) => l.id === lesson.id);
   const prev = siblings[idx - 1];
-  const next = siblings[idx + 1] || nextModuleFirst(mod);
-  const quiz = Array.isArray(lesson.quiz_json) ? lesson.quiz_json : [];
+  const next = siblings[idx + 1];
+  // After a module's last lesson, its Mythbusters come next (then the next module).
+  const afterModule = !next && mod?.myths_json.length
+    ? { href: `#/module/${mod.module_number}/myths`, title: `Module ${mod.module_number} Mythbusters` }
+    : null;
+  const nextAny = next || nextModuleFirst(mod);
+  const quiz = Array.isArray(quizRes.data) ? quizRes.data : [];
   const prior = state.progress.get(lesson.id);
 
   app.innerHTML = `
     <nav class="crumbs" aria-label="Breadcrumb"><a href="#/dashboard">Dashboard</a> / <span>Module ${esc(mod?.module_number ?? '?')}: ${esc(mod?.title ?? '')}</span></nav>
     <article class="lesson">
+      ${needsBaseline() ? `<div class="notice start"><strong>Before you start:</strong> take the two-minute <a href="#/checklist">Security Checklist</a> to record your current habits, so you can measure your progress at the end of the course.</div>` : ''}
       <header class="lesson-head card">
         <div class="lesson-meta">
           <span class="badge ${esc((mod?.difficulty || '').toLowerCase())}">${esc(mod?.difficulty || '')}</span>
@@ -62,7 +72,13 @@ export async function renderLesson(app, lessonId) {
       </section>
       <nav class="lesson-nav">
         ${prev ? `<a class="btn" href="#/lesson/${prev.id}">← ${esc(prev.title)}</a>` : '<span></span>'}
-        ${next ? `<a class="btn" href="#/lesson/${next.id}">${esc(next.title)} →</a>` : '<a class="btn" href="#/dashboard">Back to dashboard</a>'}
+        ${
+          afterModule
+            ? `<a class="btn" href="${afterModule.href}">${esc(afterModule.title)} →</a>`
+            : nextAny
+              ? `<a class="btn" href="#/lesson/${nextAny.id}">${esc(nextAny.title)} →</a>`
+              : '<a class="btn" href="#/dashboard">Back to dashboard</a>'
+        }
       </nav>
     </article>`;
 
@@ -86,52 +102,57 @@ export async function renderLesson(app, lessonId) {
       toast('Please answer every question first', 'error');
       return;
     }
-    const correct = answers.filter((a, i) => a === quiz[i].answer).length;
-    const score = Math.round((correct / quiz.length) * 100);
+    const submitBtn = form.querySelector('button[type=submit]');
+    submitBtn.disabled = true;
+    let graded;
+    try {
+      graded = await apiFetch('/api/quiz/submit', { method: 'POST', body: { lesson_id: lesson.id, answers } });
+    } catch (err) {
+      submitBtn.disabled = false;
+      toast(`Could not submit: ${err.message}`, 'error');
+      return;
+    }
+    const { correct, total, score, passed, pass_mark: passMark, results, best, completed } = graded;
 
-    // Per-question feedback
+    // Per-question feedback (answers and explanations arrive only after submitting)
     quiz.forEach((q, i) => {
+      const r = results[i];
       const box = $(`#qfb-${i}`, app);
-      const ok = answers[i] === q.answer;
-      box.className = `q-feedback ${ok ? 'ok' : 'bad'}`;
-      box.innerHTML = `<strong>${ok ? 'Correct.' : `Not quite. The answer is: ${esc(q.options[q.answer])}.`}</strong> ${esc(q.explanation || '')}`;
+      box.className = `q-feedback ${r.correct ? 'ok' : 'bad'}`;
+      box.innerHTML = `<strong>${r.correct ? 'Correct.' : `Not quite. The answer is: ${esc(q.options[r.answer])}.`}</strong> ${esc(r.explanation)}`;
       $$(`input[name="q${i}"]`, form).forEach((inp) => {
         inp.disabled = true;
         const lbl = inp.closest('label');
-        if (Number(inp.value) === q.answer) lbl.classList.add('right');
+        if (Number(inp.value) === r.answer) lbl.classList.add('right');
         else if (inp.checked) lbl.classList.add('wrong');
       });
     });
-    form.querySelector('button[type=submit]').hidden = true;
+    submitBtn.hidden = true;
 
-    const passed = score >= PASS_MARK;
-    const prev = state.progress.get(lesson.id);
-    const best = Math.max(score, prev?.quiz_score ?? 0);
-    const completed = passed || !!prev?.completed;
     const result = $('#quiz-result', app);
     result.innerHTML = `<div class="quiz-score ${passed ? 'ok' : 'bad'}">
         <div class="big">${score}%</div>
-        <div><strong>${correct} of ${quiz.length} correct.</strong> Calculation: ${correct} ÷ ${quiz.length} × 100 = ${score}%.
-        ${passed ? 'Lesson completed!' : `You need ${PASS_MARK}% to complete this lesson.`}</div>
+        <div><strong>${correct} of ${total} correct.</strong> Calculation: ${correct} ÷ ${total} × 100 = ${score}%.
+        ${passed ? 'Lesson completed!' : `You need ${passMark}% to complete this lesson.`}</div>
         <button class="btn small" id="retake" type="button">Retake quiz</button>
       </div>`;
     $('#retake', app).addEventListener('click', () => renderLesson(app, lessonId));
 
-    const supabase = await getSupabase();
-    const row = {
-      user_id: state.session.user.id,
-      lesson_id: lesson.id,
-      completed,
-      quiz_score: best,
-      completed_at: new Date().toISOString()
-    };
-    const { error } = await supabase.from('user_progress').upsert(row, { onConflict: 'user_id,lesson_id' });
-    if (error) {
-      toast(`Score not saved: ${error.message}`, 'error');
-      return;
-    }
+    const wasComplete = courseComplete();
     state.progress.set(lesson.id, { lesson_id: lesson.id, completed, quiz_score: best });
     toast(passed ? 'Progress saved' : 'Score saved — try again to complete', passed ? 'success' : 'info');
+
+    // This quiz finished the whole course: send them back to the checklist.
+    if (!wasComplete && courseComplete()) {
+      result.insertAdjacentHTML(
+        'beforeend',
+        `<section class="card banner celebrate" role="status">
+          <h2>You finished all 8 modules!</h2>
+          <p>Now that you understand the real-world risks and why OpSec matters, revisit your Security Checklist to review, update, and lock in your security practices.</p>
+          <a class="btn primary" href="#/checklist">Review and lock in my practices</a>
+        </section>`
+      );
+    }
   });
 }
 

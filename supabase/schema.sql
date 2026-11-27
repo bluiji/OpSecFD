@@ -50,13 +50,45 @@ create table if not exists public.user_progress (
   unique (user_id, lesson_id)
 );
 
+-- One row per user, checklist item, and stage.
+--   'baseline' = "Before you start" audit, locked once saved.
+--   'final'    = re-evaluation after finishing all modules.
 create table if not exists public.user_checklists (
   id          serial primary key,
   user_id     uuid not null references public.profiles (id) on delete cascade,
+  stage       text not null default 'baseline' check (stage in ('baseline', 'final')),
   item_key    text not null,
   is_checked  boolean not null default false,
   updated_at  timestamptz not null default now(),
-  unique (user_id, item_key)
+  constraint user_checklists_user_stage_item_key unique (user_id, stage, item_key)
+);
+
+-- Upgrade path for databases created before checklist stages existed:
+-- existing rows become the user's baseline.
+alter table public.user_checklists
+  add column if not exists stage text not null default 'baseline';
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'user_checklists_stage_check') then
+    alter table public.user_checklists
+      add constraint user_checklists_stage_check check (stage in ('baseline', 'final'));
+  end if;
+  alter table public.user_checklists drop constraint if exists user_checklists_user_id_item_key_key;
+  if not exists (select 1 from pg_constraint where conname = 'user_checklists_user_stage_item_key') then
+    alter table public.user_checklists
+      add constraint user_checklists_user_stage_item_key unique (user_id, stage, item_key);
+  end if;
+end $$;
+
+-- When each stage was saved, and the score (items checked) at that moment.
+create table if not exists public.user_checklist_status (
+  user_id                uuid primary key references public.profiles (id) on delete cascade,
+  baseline_completed_at  timestamptz,
+  baseline_score         int check (baseline_score >= 0),
+  final_completed_at     timestamptz,
+  final_score            int check (final_score >= 0),
+  total_items            int check (total_items > 0),
+  updated_at             timestamptz not null default now()
 );
 
 create table if not exists public.daily_tips (
@@ -65,12 +97,32 @@ create table if not exists public.daily_tips (
   category  text
 );
 
-create table if not exists public.glossary_terms (
+-- Myths vs. facts shown inside each module: [{ "myth": "...", "fact": "..." }]
+alter table public.modules
+  add column if not exists myths_json jsonb not null default '[]'::jsonb;
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'modules_myths_json_is_array') then
+    alter table public.modules
+      add constraint modules_myths_json_is_array check (jsonb_typeof(myths_json) = 'array');
+  end if;
+end $$;
+
+-- Real-world incidents for the Reference Hub.
+-- links_json: [{ "label": "...", "url": "https://..." }]
+create table if not exists public.case_studies (
   id          serial primary key,
-  term        text not null unique,
-  definition  text not null,
-  category    text
+  sort_order  int not null default 0,
+  title       text not null unique,
+  summary     text not null,
+  failure     text not null,
+  lesson      text not null,
+  links_json  jsonb not null default '[]'::jsonb check (jsonb_typeof(links_json) = 'array')
 );
+
+-- The glossary was removed from the app. The table is left in place on
+-- existing databases so no data is lost; drop it yourself if you want:
+--   drop table if exists public.glossary_terms;
 
 create index if not exists lessons_module_idx        on public.lessons (module_id, lesson_order);
 create index if not exists user_progress_lesson_idx  on public.user_progress (lesson_id);
@@ -158,6 +210,88 @@ create trigger guard_profile_update
   for each row execute function public.guard_profile_update();
 
 -- ---------------------------------------------------------------------
+-- 4b. TRIGGERS: keep a saved checklist baseline fixed
+-- Once a user saves their "Before you start" baseline, its items and
+-- score can't be changed, so before/after comparisons stay meaningful.
+-- The service role / SQL editor (auth.uid() is null) can still fix data.
+-- ---------------------------------------------------------------------
+
+create or replace function public.guard_checklist_baseline()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if auth.uid() is null or new.stage <> 'baseline' then
+    return new;
+  end if;
+  if exists (
+    select 1 from public.user_checklist_status s
+    where s.user_id = new.user_id and s.baseline_completed_at is not null
+  ) then
+    raise exception 'Your baseline is already saved and cannot be changed' using errcode = '42501';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists guard_checklist_baseline on public.user_checklists;
+create trigger guard_checklist_baseline
+  before insert or update on public.user_checklists
+  for each row execute function public.guard_checklist_baseline();
+
+create or replace function public.guard_checklist_status()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if auth.uid() is null then
+    return new;
+  end if;
+  if old.baseline_completed_at is not null and (
+       new.baseline_completed_at is distinct from old.baseline_completed_at
+       or new.baseline_score is distinct from old.baseline_score) then
+    raise exception 'Your baseline is already saved and cannot be changed' using errcode = '42501';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists guard_checklist_status on public.user_checklist_status;
+create trigger guard_checklist_status
+  before update on public.user_checklist_status
+  for each row execute function public.guard_checklist_status();
+
+-- ---------------------------------------------------------------------
+-- 4c. lesson_quiz(): quiz questions and options WITHOUT answers or explanations
+-- Signed-in users can't read lessons.quiz_json (see GRANTS), so the lesson
+-- page calls this instead. Answers are revealed by /api/quiz/submit only
+-- after an attempt.
+-- ---------------------------------------------------------------------
+
+create or replace function public.lesson_quiz(p_lesson_id int)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = ''
+as $
+  select coalesce(
+    jsonb_agg(jsonb_build_object('question', q.value -> 'question', 'options', q.value -> 'options') order by q.ordinality),
+    '[]'::jsonb)
+  from public.lessons l
+  cross join lateral jsonb_array_elements(l.quiz_json) with ordinality as q(value, ordinality)
+  where l.id = p_lesson_id
+    and auth.uid() is not null;
+$;
+
+revoke all on function public.lesson_quiz(int) from public, anon;
+grant execute on function public.lesson_quiz(int) to authenticated;
+
+-- ---------------------------------------------------------------------
 -- 5. ROW-LEVEL SECURITY
 -- ---------------------------------------------------------------------
 
@@ -167,13 +301,14 @@ alter table public.lessons         enable row level security;
 alter table public.user_progress   enable row level security;
 alter table public.user_checklists enable row level security;
 alter table public.daily_tips      enable row level security;
-alter table public.glossary_terms  enable row level security;
+alter table public.case_studies    enable row level security;
+alter table public.user_checklist_status enable row level security;
 
 -- Content tables: any signed-in user reads, only admins write.
 do $$
 declare t text;
 begin
-  foreach t in array array['modules', 'lessons', 'daily_tips', 'glossary_terms'] loop
+  foreach t in array array['modules', 'lessons', 'daily_tips', 'case_studies'] loop
     execute format('drop policy if exists "%1$s_select_authenticated" on public.%1$I', t);
     execute format('drop policy if exists "%1$s_insert_admin" on public.%1$I', t);
     execute format('drop policy if exists "%1$s_update_admin" on public.%1$I', t);
@@ -192,10 +327,12 @@ begin
 end $$;
 
 -- Per-user tables: own rows only; admins may read everything.
-do $$
+-- user_progress is read-only for users: quiz scores are written only by
+-- /api/quiz/submit (service role) after grading on the server.
+do $
 declare t text;
 begin
-  foreach t in array array['user_progress', 'user_checklists'] loop
+  foreach t in array array['user_progress', 'user_checklists', 'user_checklist_status'] loop
     execute format('drop policy if exists "%1$s_select_own_or_admin" on public.%1$I', t);
     execute format('drop policy if exists "%1$s_insert_own" on public.%1$I', t);
     execute format('drop policy if exists "%1$s_update_own" on public.%1$I', t);
@@ -203,6 +340,7 @@ begin
     execute format('create policy "%1$s_select_own_or_admin" on public.%1$I
                       for select to authenticated
                       using ((select auth.uid()) = user_id or (select public.is_admin()))', t);
+    continue when t = 'user_progress';
     execute format('create policy "%1$s_insert_own" on public.%1$I
                       for insert to authenticated with check ((select auth.uid()) = user_id)', t);
     execute format('create policy "%1$s_update_own" on public.%1$I
@@ -211,6 +349,11 @@ begin
                       with check ((select auth.uid()) = user_id)', t);
   end loop;
 end $$;
+
+-- Case studies are public teaching material, also shown to signed-out visitors.
+drop policy if exists "case_studies_select_anon" on public.case_studies;
+create policy "case_studies_select_anon" on public.case_studies
+  for select to anon using (true);
 
 -- Profiles
 drop policy if exists "profiles_select_own_or_admin" on public.profiles;
@@ -233,20 +376,35 @@ create policy "profiles_update_admin" on public.profiles
 
 -- ---------------------------------------------------------------------
 -- 6. GRANTS (explicit, so the app works even if default grants differ)
--- anon gets nothing: every table requires a signed-in user.
+-- anon can only read case_studies; every other table requires a signed-in user.
 -- ---------------------------------------------------------------------
 
 revoke all on public.profiles, public.modules, public.lessons, public.user_progress,
-              public.user_checklists, public.daily_tips, public.glossary_terms from anon;
+              public.user_checklists, public.user_checklist_status, public.daily_tips,
+              public.case_studies from anon;
+grant select on public.case_studies to anon;
 
 grant select, update                 on public.profiles        to authenticated;
 grant select, insert, update, delete on public.modules         to authenticated;
-grant select, insert, update, delete on public.lessons         to authenticated;
+-- lessons: every column except quiz_json (it holds the answer keys).
+-- Questions come from public.lesson_quiz(); grading happens in /api/quiz/submit.
+revoke select on public.lessons from authenticated;
+grant select (id, module_id, lesson_order, title, what_is_it, why_it_matters,
+              how_it_works, real_world_scenario, how_to_protect)
+                                     on public.lessons         to authenticated;
+grant insert, update, delete         on public.lessons         to authenticated;
 grant select, insert, update, delete on public.daily_tips      to authenticated;
-grant select, insert, update, delete on public.glossary_terms  to authenticated;
-grant select, insert, update         on public.user_progress   to authenticated;
+grant select, insert, update, delete on public.case_studies    to authenticated;
+revoke insert, update, delete        on public.user_progress   from authenticated;
+grant select                         on public.user_progress   to authenticated;
 grant select, insert, update         on public.user_checklists to authenticated;
+grant select, insert, update         on public.user_checklist_status to authenticated;
 grant usage, select on all sequences in schema public to authenticated;
+
+-- The API routes use the service role (bypasses RLS). Supabase grants this by
+-- default; it's repeated here so the quiz API works even if defaults differ.
+grant select, insert, update, delete on all tables in schema public to service_role;
+grant usage, select on all sequences in schema public to service_role;
 
 -- ---------------------------------------------------------------------
 -- 7. REALTIME for the checklist (skipped if the publication is missing)
@@ -277,6 +435,16 @@ insert into public.modules (module_number, title, difficulty, description) value
   (7, 'Practical Operational Security', 'Advanced', 'Threat modeling, risk assessment, compartmentalization, need-to-know, classification, secure communication, and case studies.'),
   (8, 'Incident Response & Recovery', 'Advanced', 'Recognizing compromise, breach response, cleaning devices, account recovery, backups, reporting cybercrime, and your checklist.')
 on conflict (module_number) do nothing;
+
+-- Mythbusters per module (only where none are set yet)
+update public.modules set myths_json = '[{"myth":"I''m not important enough to be hacked.","fact":"Many attacks are automated and target anyone reachable. Mass phishing and credential stuffing don''t pick victims by importance; your email, money, and contacts are worth something to a scammer."},{"myth":"OpSec is only for spies, soldiers, and journalists.","fact":"OpSec is a simple habit: know what to protect, who might want it, and how it could leak. The same thinking protects your bank account, your home address, and your family."},{"myth":"I have nothing to hide, so privacy doesn''t matter.","fact":"Privacy isn''t about hiding wrongdoing. Your birthday, address, and pet''s name can be enough to guess security answers, reset accounts, or impersonate you."}]'::jsonb where module_number = 1 and myths_json = '[]'::jsonb;
+update public.modules set myths_json = '[{"myth":"Only gullible people fall for scams.","fact":"Social engineering works by creating urgency, fear, or trust, and it catches smart, busy people every day. A pause-and-verify habit matters more than intelligence."},{"myth":"A message from a friend or family member is safe.","fact":"Accounts get hijacked and names are easy to fake. If a ''friend'' suddenly asks for money, codes, or a link click, confirm through a different channel, such as calling them."},{"myth":"My bank may call and ask for my OTP to verify me.","fact":"Banks and e-wallets do not ask you to read out a one-time code. Anyone asking for it is trying to log in as you. Hang up and call the number on your card."}]'::jsonb where module_number = 2 and myths_json = '[]'::jsonb;
+update public.modules set myths_json = '[{"myth":"Strong passwords need to be complicated gibberish.","fact":"Length matters most. A passphrase of four or more random, unrelated words is strong and easier to remember, and a password manager can handle the rest."},{"myth":"Changing my password every month is best.","fact":"Current NIST guidance (SP 800-63B) recommends long, unique passwords that you change when there''s evidence of compromise, rather than forced periodic changes that lead to weak patterns."},{"myth":"MFA by text message is useless.","fact":"SMS is the weakest MFA option because of SIM swaps and phishing, but it is still much better than a password alone. Upgrade to an authenticator app or passkey when you can."}]'::jsonb where module_number = 3 and myths_json = '[]'::jsonb;
+update public.modules set myths_json = '[{"myth":"Macs and iPhones can''t get malware.","fact":"They have strong built-in protections, but malware, phishing, and malicious profiles exist for every platform. Updates and caution still matter."},{"myth":"Antivirus means I''m fully protected.","fact":"Antivirus is one layer. It doesn''t stop you from typing your password into a phishing site or sharing an OTP with a scammer."},{"myth":"Updates only add features, so I can put them off.","fact":"Many updates fix security holes that attackers already know about. Delaying them leaves a known, published weakness open on your device."}]'::jsonb where module_number = 4 and myths_json = '[]'::jsonb;
+update public.modules set myths_json = '[{"myth":"The padlock means the website is safe.","fact":"HTTPS means the connection is encrypted and the site controls that domain. Scammers can get certificates for their own look-alike domains, so always check the domain itself."},{"myth":"A VPN makes me completely anonymous.","fact":"A VPN hides your traffic from the local network and your ISP and changes your visible IP address, but the VPN provider can see your connection metadata, and logins, cookies, and fingerprinting can still identify you."},{"myth":"Public Wi-Fi with a password is private.","fact":"Everyone who knows the café''s password is on the same network, and anyone can set up a look-alike hotspot. Prefer mobile data for sensitive tasks and confirm the network name with staff."}]'::jsonb where module_number = 5 and myths_json = '[]'::jsonb;
+update public.modules set myths_json = '[{"myth":"Incognito mode makes me anonymous.","fact":"Private browsing only stops your browser from saving history and cookies after you close the window. Websites, your ISP, and school or work networks can still see your activity."},{"myth":"If I delete a post, it''s gone.","fact":"Screenshots, reposts, archives, and backups can keep copies after you delete the original."},{"myth":"A private account keeps everything private.","fact":"Your profile photo, name, and bio are often still public, and any follower can screenshot or share your posts. Only post what you would be comfortable seeing in public."}]'::jsonb where module_number = 6 and myths_json = '[]'::jsonb;
+update public.modules set myths_json = '[{"myth":"Good OpSec means being suspicious of everything.","fact":"Good OpSec is proportional. A threat model helps you spend effort on the risks that are likely and harmful, instead of worrying about everything equally."},{"myth":"Encryption alone keeps my communications secret.","fact":"Encryption protects content, but metadata (who, when, where, how often) can still reveal a lot, and an unlocked or infected phone exposes the messages themselves."},{"myth":"One very secure email account for everything is safest.","fact":"Putting everything in one place means one breach exposes everything. Compartmentalize: separate addresses for banking, shopping, and social media limit the damage."}]'::jsonb where module_number = 7 and myths_json = '[]'::jsonb;
+update public.modules set myths_json = '[{"myth":"If I''d been hacked, I would know.","fact":"Many compromises are silent. Attackers often read email, set forwarding rules, or wait. Check login alerts, active sessions, and mail rules regularly."},{"myth":"Paying a ransom guarantees I get my files back.","fact":"Paying offers no guarantee of a working key, can mark you as a target for repeat attacks, and funds criminals. Tested offline backups are the real protection."},{"myth":"Cloud sync is the same as a backup.","fact":"Sync copies deletions and encrypted files to every device too. A real backup keeps older versions or offline copies that ransomware and mistakes can''t reach."}]'::jsonb where module_number = 8 and myths_json = '[]'::jsonb;
 
 -- Module 1
 insert into public.lessons (module_id, lesson_order, title, what_is_it, why_it_matters, how_it_works, real_world_scenario, how_to_protect, quiz_json)
@@ -1136,52 +1304,14 @@ insert into public.daily_tips (tip_text, category) values
   ('Never plug in a USB drive you found. Hand it to IT or security instead.', 'Devices')
 on conflict (tip_text) do nothing;
 
-insert into public.glossary_terms (term, definition, category) values
-  ('OpSec', 'Operational Security: a process for identifying critical information and protecting it from people who could misuse it.', 'Fundamentals'),
-  ('Threat', 'A person, group, or event that could cause harm, such as a scammer, malware, or a thief.', 'Fundamentals'),
-  ('Vulnerability', 'A weakness that a threat could exploit, such as a reused password or outdated software.', 'Fundamentals'),
-  ('Risk', 'The likelihood that a threat exploits a vulnerability, combined with the impact if it does.', 'Fundamentals'),
-  ('Threat Model', 'A description of what you are protecting, from whom, how likely and severe the harm is, and how much effort protection is worth.', 'Fundamentals'),
-  ('Digital Footprint', 'The trail of data about you online, both shared on purpose (active) and collected about you (passive).', 'Privacy'),
-  ('Social Engineering', 'Manipulating people into revealing information, sending money, or granting access.', 'Human Threats'),
-  ('Phishing', 'Fraudulent messages designed to steal credentials or money, or to deliver malware.', 'Human Threats'),
-  ('Spear Phishing', 'Phishing targeted at a specific person or group using personal details.', 'Human Threats'),
-  ('Smishing', 'Phishing by SMS or chat message.', 'Human Threats'),
-  ('Vishing', 'Phishing by voice call.', 'Human Threats'),
-  ('Pretexting', 'Using a made-up scenario to persuade someone to share information or take an action.', 'Human Threats'),
-  ('Tailgating', 'Following an authorized person through a secure door without authenticating.', 'Physical'),
-  ('Shoulder Surfing', 'Watching someone''s screen or keypad to steal information.', 'Physical'),
-  ('MFA', 'Multi-Factor Authentication: requiring two or more types of proof (know, have, are) to log in.', 'Accounts'),
-  ('Passkey', 'A phishing-resistant login credential based on public-key cryptography (FIDO2/WebAuthn) stored on your device or password manager.', 'Accounts'),
-  ('Password Manager', 'An app that generates, stores, and fills unique passwords in an encrypted vault.', 'Accounts'),
-  ('Credential Stuffing', 'Automatically trying leaked username/password pairs on other websites.', 'Accounts'),
-  ('Brute-Force Attack', 'Trying many possible passwords until one works.', 'Accounts'),
-  ('SIM Swap', 'Tricking a mobile carrier into moving your phone number to an attacker''s SIM card.', 'Accounts'),
-  ('Entropy', 'A measure of unpredictability. In passwords, more bits of entropy mean more possible guesses are needed.', 'Accounts'),
-  ('Malware', 'Any software designed to harm, spy on, or take control of a device.', 'Devices'),
-  ('Ransomware', 'Malware that encrypts or locks data and demands payment.', 'Devices'),
-  ('Trojan', 'Malware disguised as legitimate software.', 'Devices'),
-  ('Spyware', 'Software that secretly monitors activity. Stalkerware is spyware used to monitor a partner or person without consent.', 'Devices'),
-  ('Patch', 'A software update that fixes bugs or security vulnerabilities.', 'Devices'),
-  ('Full-Disk Encryption', 'Encrypting all data on a storage device so it is unreadable without the unlock key.', 'Devices'),
-  ('Attack Surface', 'All the points where an attacker could try to enter or extract data from a system.', 'Devices'),
-  ('VPN', 'Virtual Private Network: an encrypted tunnel between your device and a VPN server.', 'Network'),
-  ('DNS', 'Domain Name System: translates domain names into IP addresses.', 'Network'),
-  ('HTTPS', 'HTTP over TLS: encrypts traffic between your browser and a website and authenticates the domain.', 'Network'),
-  ('Man-in-the-Middle (MITM)', 'An attack where someone secretly intercepts or alters communication between two parties.', 'Network'),
-  ('Evil Twin', 'A rogue Wi-Fi access point that imitates a legitimate one.', 'Network'),
-  ('Firewall', 'A system that allows or blocks network connections based on rules.', 'Network'),
-  ('End-to-End Encryption (E2EE)', 'Encryption where only the communicating users can read the messages, not the service provider.', 'Network'),
-  ('Metadata', 'Data about data, such as who sent a message and when, or where a photo was taken.', 'Privacy'),
-  ('EXIF', 'Metadata stored in image files: camera, time, and sometimes GPS location.', 'Privacy'),
-  ('Browser Fingerprinting', 'Identifying a browser by combining many of its characteristics, without cookies.', 'Privacy'),
-  ('Third-Party Cookie', 'A cookie set by a domain other than the site you are visiting, often used for cross-site tracking.', 'Privacy'),
-  ('Tor', 'A network that routes traffic through multiple volunteer relays to hide your IP address from destinations.', 'Privacy'),
-  ('Compartmentalization', 'Separating accounts, devices, or identities so a compromise in one area does not spread.', 'Practical OpSec'),
-  ('Need-to-Know', 'Sharing information only with those who require it for their role.', 'Practical OpSec'),
-  ('Data Breach', 'Unauthorized access to or disclosure of an organization''s data.', 'Incident Response'),
-  ('3-2-1 Backup Rule', 'Keep 3 copies of data, on 2 types of storage, with 1 copy off-site.', 'Incident Response')
-on conflict (term) do nothing;
+insert into public.case_studies (sort_order, title, summary, failure, lesson, links_json) values
+  (1, 'Fitness heatmap reveals sensitive sites (2018)', 'In January 2018, analysts pointed out that Strava''s public global heatmap, built from users'' recorded workouts, showed activity patterns around military bases in remote areas, revealing their layouts and patrol routes.', 'Individually harmless workout data, shared under default settings, became sensitive when aggregated.', 'Check privacy defaults on fitness and location apps; aggregated data can reveal what individual data points do not.', '[{"label":"The Guardian: Strava gives away location of secret US army bases","url":"https://www.theguardian.com/world/2018/jan/28/fitness-tracking-app-gives-away-location-of-secret-us-army-bases"},{"label":"BBC News: Fitness app Strava lights up staff at military bases","url":"https://www.bbc.com/news/technology-42853072"}]'::jsonb),
+  (2, 'Twitter phone spear-phishing (2020)', 'On July 15, 2020, attackers phoned Twitter employees and talked some of them into giving up credentials, then used internal tools to take over high-profile accounts and post a cryptocurrency scam.', 'Social engineering of staff with access to powerful internal tools.', 'Verify callers independently, use phishing-resistant MFA, and limit who can access powerful tools.', '[{"label":"Krebs on Security: Who''s behind Wednesday''s epic Twitter hack?","url":"https://krebsonsecurity.com/2020/07/whos-behind-wednesdays-epic-twitter-hack/"}]'::jsonb),
+  (3, 'Colonial Pipeline ransomware (2021)', 'In May 2021, a ransomware attack led Colonial Pipeline to shut down its U.S. fuel pipeline for several days. The company''s CEO later told the U.S. Senate that attackers got in through a legacy VPN account protected only by a password, without MFA.', 'An old, unused account with a single factor remained active.', 'Turn on MFA everywhere and remove accounts you no longer use.', '[{"label":"CISA: The attack on Colonial Pipeline, what we''ve learned","url":"https://www.cisa.gov/news-events/news/attack-colonial-pipeline-what-weve-learned-what-weve-done-over-past-two-years"},{"label":"CISA advisory AA21-131A: DarkSide ransomware","url":"https://www.cisa.gov/news-events/cybersecurity-advisories/aa21-131a"}]'::jsonb),
+  (4, 'Photo metadata reveals a location (2012)', 'In December 2012, a photo published online of John McAfee, who was avoiding authorities, still contained EXIF GPS metadata that indicated he was in Guatemala.', 'The original image file was shared with location metadata intact.', 'Strip location data from photos before sharing, and assume original files contain more than you can see.', '[{"label":"WIRED: Did Vice just give away John McAfee''s location with photo metadata?","url":"https://www.wired.com/2012/12/oops-did-vice-just-give-away-john-mcafees-location-with-this-photo/"}]'::jsonb),
+  (5, 'Support desks social-engineered (2012)', 'Technology journalist Mat Honan described how attackers combined information obtained from Amazon and Apple customer support to take over his Apple ID, remotely erase his iPhone, iPad, and MacBook, and hijack his Twitter account. Many personal photos were lost because he had no backup.', 'Linked accounts with weak recovery processes, and no backups.', 'Secure recovery options, use MFA, compartmentalize important accounts, and keep backups.', '[{"label":"WIRED: How Apple and Amazon security flaws led to my epic hacking","url":"https://www.wired.com/2012/08/apple-amazon-mat-honan-hacking/"},{"label":"WIRED: How I resurrected my digital life after an epic hacking","url":"https://www.wired.com/2012/08/mat-honan-data-recovery/"}]'::jsonb),
+  (6, 'Third-party vendor access (Target, 2013)', 'Attackers used network credentials stolen from a heating and air-conditioning vendor to get into Target''s network, then stole payment card data from about 40 million cards during the 2013 holiday season.', 'Third-party access was not well separated from sensitive systems.', 'Limit access on a need-to-know basis and separate (compartmentalize) systems.', '[{"label":"Krebs on Security: Target hackers broke in via HVAC company","url":"https://krebsonsecurity.com/2014/02/target-hackers-broke-in-via-hvac-company/"}]'::jsonb)
+on conflict (title) do nothing;
 
 -- ---------------------------------------------------------------------
 -- 9. MAKE YOURSELF AN ADMIN (run separately after you sign up in the app)
