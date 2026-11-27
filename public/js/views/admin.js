@@ -55,8 +55,8 @@ async function lessonManager(body) {
   const editor = $('#am-editor', body);
 
   async function loadList() {
-    const { data, error: e } = await supabase.from('lessons').select('*').eq('module_id', moduleId).order('lesson_order');
-    if (e) throw e;
+    // Via the admin API: quiz answer keys aren't readable from the browser's own Supabase session.
+    const { lessons: data } = await adminFetch(`/api/admin/lessons?module_id=${encodeURIComponent(moduleId)}`);
     list.innerHTML = data.length
       ? data.map((l) => `<li><button class="link-btn" data-id="${l.id}">${l.lesson_order}. ${esc(l.title)}</button></li>`).join('')
       : '<li class="muted">No lessons in this module.</li>';

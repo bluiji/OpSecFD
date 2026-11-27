@@ -5,7 +5,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { module1, module2 } from '../supabase/seed/modules-1-2.mjs';
 import { module3, module4, module5, module6, module7, module8 } from '../supabase/seed/modules-3-8.mjs';
-import { modules, tips, glossary } from '../supabase/seed/meta.mjs';
+import { modules, tips } from '../supabase/seed/meta.mjs';
+import { myths, caseStudies } from '../supabase/seed/extras.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const q = (s) => (s == null ? 'null' : `'${String(s).replace(/'/g, "''")}'`);
@@ -28,6 +29,19 @@ for (const [num, lessons] of Object.entries(lessonsByModule)) {
     });
   });
 }
+for (const [n] of modules) {
+  const list = myths[n];
+  if (!Array.isArray(list) || !list.length) problems.push(`Module ${n}: needs at least one myth`);
+  (list || []).forEach((m, i) => {
+    if (!m.myth || !m.fact) problems.push(`Module ${n} myth ${i + 1}: needs myth and fact`);
+  });
+}
+caseStudies.forEach((c, i) => {
+  for (const f of ['title', 'summary', 'failure', 'lesson']) if (!c[f]) problems.push(`Case study ${i + 1}: missing ${f}`);
+  for (const l of c.links || []) {
+    if (!l.label || !/^https:\/\//.test(l.url || '')) problems.push(`Case study ${i + 1}: links need a label and an https URL`);
+  }
+});
 if (problems.length) {
   console.error(problems.join('\n'));
   process.exit(1);
@@ -38,6 +52,13 @@ let sql = `\n-- ================================================================
 sql += `insert into public.modules (module_number, title, difficulty, description) values\n`;
 sql += modules.map(([n, t, d, desc]) => `  (${n}, ${q(t)}, ${q(d)}, ${q(desc)})`).join(',\n');
 sql += `\non conflict (module_number) do nothing;\n\n`;
+
+// Myths: only fill modules that have none yet, so admin edits survive a re-run.
+sql += `-- Mythbusters per module (only where none are set yet)\n`;
+for (const [n] of modules) {
+  sql += `update public.modules set myths_json = ${q(JSON.stringify(myths[n]))}::jsonb where module_number = ${n} and myths_json = '[]'::jsonb;\n`;
+}
+sql += `\n`;
 
 let total = 0;
 for (const [num, lessons] of Object.entries(lessonsByModule)) {
@@ -56,12 +77,14 @@ sql += `insert into public.daily_tips (tip_text, category) values\n`;
 sql += tips.map(([t, c]) => `  (${q(t)}, ${q(c)})`).join(',\n');
 sql += `\non conflict (tip_text) do nothing;\n\n`;
 
-sql += `insert into public.glossary_terms (term, definition, category) values\n`;
-sql += glossary.map(([t, d, c]) => `  (${q(t)}, ${q(d)}, ${q(c)})`).join(',\n');
-sql += `\non conflict (term) do nothing;\n\n`;
+sql += `insert into public.case_studies (sort_order, title, summary, failure, lesson, links_json) values\n`;
+sql += caseStudies
+  .map((c, i) => `  (${i + 1}, ${q(c.title)}, ${q(c.summary)}, ${q(c.failure)}, ${q(c.lesson)}, ${q(JSON.stringify(c.links))}::jsonb)`)
+  .join(',\n');
+sql += `\non conflict (title) do nothing;\n\n`;
 
 sql += `-- ---------------------------------------------------------------------\n-- 9. MAKE YOURSELF AN ADMIN (run separately after you sign up in the app)\n-- update public.profiles set role = 'admin' where email = 'you@example.com';\n-- ---------------------------------------------------------------------\n`;
 
 const ddl = readFileSync(join(root, 'supabase/ddl.sql'), 'utf8');
 writeFileSync(join(root, 'supabase/schema.sql'), ddl + sql);
-console.log(`schema.sql written: ${modules.length} modules, ${total} lessons, ${tips.length} tips, ${glossary.length} glossary terms`);
+console.log(`schema.sql written: ${modules.length} modules, ${total} lessons, ${tips.length} tips, ${caseStudies.length} case studies`);

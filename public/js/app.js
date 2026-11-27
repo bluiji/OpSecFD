@@ -1,12 +1,22 @@
 // Boot, auth session handling, navigation, and hash router.
 import { getSupabase } from './supabaseClient.js';
-import { state, loadProfile, clearState, isAdmin } from './state.js';
+import { state, loadProfile, clearState, isAdmin, needsBaseline } from './state.js';
 import { $, $$, esc, toast, icons } from './utils.js';
 import { renderDashboard } from './views/dashboard.js';
 import { renderLesson } from './views/lesson.js';
 import { renderLabs } from './views/labs.js';
 import { renderReference } from './views/reference.js';
 import { renderAdmin } from './views/admin.js';
+import { renderChecklist } from './views/checklist.js';
+import { renderMyths } from './views/myths.js';
+
+// Where Supabase sends users back from auth emails. Add these to
+// Supabase → Authentication → URL Configuration → Redirect URLs.
+const RECOVERY_REDIRECT = () => `${location.origin}/?auth=recovery`;
+const SIGNIN_REDIRECT = () => `${location.origin}/`;
+
+/** Signed-in home: the checklist until a baseline is saved, then the dashboard. */
+const home = () => (needsBaseline() ? '#/checklist' : '#/dashboard');
 
 const app = $('#app');
 let cleanup = null; // per-view teardown (e.g., realtime channels)
@@ -16,12 +26,16 @@ const MOTTO =
 
 // ---------------------------------------------------------------- routes
 const routes = [
-  { re: /^#?\/?$/, view: () => (state.session ? go('#/dashboard') : renderLanding()) },
-  { re: /^#\/auth(?:\/(signin|signup))?$/, view: (m) => renderAuth(m[1] || 'signin') },
+  { re: /^#?\/?$/, view: () => (state.session ? go(home()) : renderLanding()) },
+  { re: /^#\/auth\/reset$/, view: () => renderResetPassword() },
+  { re: /^#\/auth(?:\/(signin|signup|forgot))?$/, view: (m) => renderAuth(m[1] || 'signin') },
   { re: /^#\/dashboard$/, auth: true, view: () => renderDashboard(app) },
+  { re: /^#\/checklist$/, auth: true, view: () => renderChecklist(app) },
   { re: /^#\/lesson\/(\d+)$/, auth: true, view: (m) => renderLesson(app, Number(m[1])) },
+  { re: /^#\/module\/(\d+)\/myths$/, auth: true, view: (m) => renderMyths(app, Number(m[1])) },
   { re: /^#\/labs(?:\/([\w-]+))?$/, view: (m) => renderLabs(app, m[1]) },
-  { re: /^#\/reference(?:\/([\w-]+))?$/, view: (m) => renderReference(app, m[1]) },
+  // Old #/reference/glossary and #/reference/myths links land on the case studies.
+  { re: /^#\/reference(?:\/[\w-]+)?$/, view: () => renderReference(app) },
   { re: /^#\/admin$/, auth: true, admin: true, view: () => renderAdmin(app) }
 ];
 
@@ -60,6 +74,7 @@ async function router() {
 function updateNav(hash) {
   const signedIn = !!state.session;
   $('#nav-dashboard').hidden = !signedIn;
+  $('#nav-checklist').hidden = !signedIn;
   $('#nav-admin').hidden = !isAdmin();
   $('#nav-signin').hidden = signedIn;
   $('#nav-signout').hidden = !signedIn;
@@ -103,34 +118,97 @@ function renderLanding() {
     </section>`;
 }
 
+/** Password input with an accessible show/hide toggle (wired up by wirePasswordToggles). */
+function passwordField({ label, name = 'password', autocomplete, minlength = 1, id }) {
+  return `<label for="${id}">${label}</label>
+    <div class="pw-field">
+      <input id="${id}" name="${name}" type="password" required minlength="${minlength}" autocomplete="${autocomplete}" spellcheck="false" autocapitalize="off">
+      <button type="button" class="pw-toggle" data-toggle-password="${id}" aria-controls="${id}" aria-pressed="false" aria-label="Show password">${icons.eyeSm}</button>
+    </div>`;
+}
+
+function wirePasswordToggles(root) {
+  $$('[data-toggle-password]', root).forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const input = document.getElementById(btn.dataset.togglePassword);
+      const show = input.type === 'password';
+      input.type = show ? 'text' : 'password';
+      btn.setAttribute('aria-pressed', String(show));
+      btn.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+      btn.innerHTML = show ? icons.eyeOff : icons.eyeSm;
+      input.focus({ preventScroll: true });
+    })
+  );
+}
+
+function checkEmailCard(title, email, extra = '') {
+  return `<section class="card narrow"><h1>${title}</h1><p>We sent an email to <strong>${esc(email)}</strong>. ${extra}</p>
+    <p class="hint">Not there after a few minutes? Check spam or promotions. Never forward these links to anyone.</p>
+    <a class="btn" href="#/auth/signin">Back to sign in</a></section>`;
+}
+
 function renderAuth(mode) {
   const signup = mode === 'signup';
+  const forgot = mode === 'forgot';
   app.innerHTML = `
     <section class="card narrow auth">
       <div class="tabs" role="tablist">
-        <a role="tab" href="#/auth/signin" aria-selected="${!signup}" class="${!signup ? 'active' : ''}">Sign in</a>
+        <a role="tab" href="#/auth/signin" aria-selected="${!signup}" class="${!signup ? 'active' : ''}">Log in</a>
         <a role="tab" href="#/auth/signup" aria-selected="${signup}" class="${signup ? 'active' : ''}">Sign up</a>
       </div>
-      <h1>${signup ? 'Create your account' : 'Welcome back'}</h1>
+      <h1>${signup ? 'Create your account' : forgot ? 'Reset your password' : 'Welcome back'}</h1>
+      ${forgot ? '<p class="muted">Enter your account email and we\'ll send you a link to choose a new password.</p>' : ''}
       <form id="auth-form" novalidate>
         ${signup ? `<label>Username<input name="username" required minlength="3" maxlength="30" pattern="[A-Za-z0-9_.\\-]+" autocomplete="username"></label>` : ''}
         <label>Email<input name="email" type="email" required autocomplete="email"></label>
-        <label>Password<input name="password" type="password" required minlength="${signup ? 8 : 1}" autocomplete="${signup ? 'new-password' : 'current-password'}"></label>
+        ${forgot ? '' : passwordField({ label: 'Password', id: 'auth-password', minlength: signup ? 8 : 1, autocomplete: signup ? 'new-password' : 'current-password' })}
         ${signup ? '<p class="hint">Use at least 8 characters. A long passphrase is best — try it in the Password Strength Lab.</p>' : ''}
+        ${!signup && !forgot ? '<p class="auth-links"><a href="#/auth/forgot">Forgot password?</a></p>' : ''}
         <p class="form-error" id="auth-error" role="alert"></p>
-        <button class="btn primary block" type="submit">${signup ? 'Create account' : 'Sign in'}</button>
+        <button class="btn primary block" type="submit">${signup ? 'Create account' : forgot ? 'Send reset link' : 'Log in'}</button>
+        ${!signup && !forgot ? '<button class="btn block subtle" type="button" id="magic-link">Email me a sign-in link instead</button>' : ''}
+        ${forgot ? '<p class="auth-links"><a href="#/auth/signin">Back to log in</a></p>' : ''}
       </form>
     </section>`;
 
-  $('#auth-form').addEventListener('submit', async (e) => {
+  const form = $('#auth-form');
+  const errEl = $('#auth-error');
+  wirePasswordToggles(form);
+
+  const emailValue = () => form.elements.email.value.trim();
+
+  $('#magic-link')?.addEventListener('click', async (e) => {
+    errEl.textContent = '';
+    if (!form.elements.email.checkValidity()) {
+      errEl.textContent = 'Enter your email address first.';
+      return form.elements.email.focus();
+    }
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const supabase = await getSupabase();
+      const { error } = await supabase.auth.signInWithOtp({
+        email: emailValue(),
+        options: { shouldCreateUser: false, emailRedirectTo: SIGNIN_REDIRECT() }
+      });
+      if (error) throw error;
+      app.innerHTML = checkEmailCard('Check your email', emailValue(), 'Open the link in this browser to sign in. It expires after a short time.');
+    } catch (err) {
+      errEl.textContent = err.message || 'Could not send the sign-in link';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const form = e.currentTarget;
-    const errEl = $('#auth-error');
     errEl.textContent = '';
     if (!form.checkValidity()) {
       errEl.textContent = signup
         ? 'Please enter a username (3–30 letters, numbers, _ . -), a valid email, and a password of at least 8 characters.'
-        : 'Please enter your email and password.';
+        : forgot
+          ? 'Please enter a valid email address.'
+          : 'Please enter your email and password.';
       return;
     }
     const fd = new FormData(form);
@@ -138,25 +216,71 @@ function renderAuth(mode) {
     btn.disabled = true;
     try {
       const supabase = await getSupabase();
-      if (signup) {
+      if (forgot) {
+        const { error } = await supabase.auth.resetPasswordForEmail(emailValue(), { redirectTo: RECOVERY_REDIRECT() });
+        if (error) throw error;
+        // Same message whether or not the account exists, so the form can't be used to find accounts.
+        app.innerHTML = checkEmailCard('Check your email', emailValue(), 'If an account exists for this address, the email has a link to choose a new password.');
+      } else if (signup) {
         const { data, error } = await supabase.auth.signUp({
-          email: fd.get('email').trim(),
+          email: emailValue(),
           password: fd.get('password'),
-          options: { data: { username: fd.get('username').trim() }, emailRedirectTo: location.origin }
+          options: { data: { username: fd.get('username').trim() }, emailRedirectTo: SIGNIN_REDIRECT() }
         });
         if (error) throw error;
         if (!data.session) {
-          app.innerHTML = `<section class="card narrow"><h1>Check your email</h1><p>We sent a confirmation link to <strong>${esc(fd.get('email'))}</strong>. Open it to activate your account, then sign in.</p><p class="hint">Not there? Check spam. Never forward this link to anyone.</p></section>`;
+          app.innerHTML = checkEmailCard('Confirm your email', emailValue(), 'Open the confirmation link to activate your account. You\'ll start with a quick Security Checklist.');
         }
       } else {
-        const { error } = await supabase.auth.signInWithPassword({
-          email: fd.get('email').trim(),
-          password: fd.get('password')
-        });
+        const { error } = await supabase.auth.signInWithPassword({ email: emailValue(), password: fd.get('password') });
         if (error) throw error;
       }
     } catch (err) {
       errEl.textContent = err.message || 'Authentication failed';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+/** Shown after the user follows a password-reset email link. */
+function renderResetPassword() {
+  if (!state.session) {
+    app.innerHTML = `<section class="card narrow"><h1>Reset link expired</h1>
+      <p>This password reset link is invalid or has expired. Request a new one.</p>
+      <a class="btn primary" href="#/auth/forgot">Send a new link</a></section>`;
+    return;
+  }
+  app.innerHTML = `
+    <section class="card narrow auth">
+      <h1>Choose a new password</h1>
+      <form id="reset-form" novalidate>
+        ${passwordField({ label: 'New password', id: 'new-password', minlength: 8, autocomplete: 'new-password' })}
+        ${passwordField({ label: 'Confirm new password', name: 'confirm', id: 'confirm-password', minlength: 8, autocomplete: 'new-password' })}
+        <p class="hint">At least 8 characters. A long passphrase is best.</p>
+        <p class="form-error" id="reset-error" role="alert"></p>
+        <button class="btn primary block" type="submit">Update password</button>
+      </form>
+    </section>`;
+  const form = $('#reset-form');
+  wirePasswordToggles(form);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const errEl = $('#reset-error');
+    errEl.textContent = '';
+    const pw = form.elements.password.value;
+    if (!form.checkValidity()) return (errEl.textContent = 'Use at least 8 characters.');
+    if (pw !== form.elements.confirm.value) return (errEl.textContent = 'The passwords don\'t match.');
+    const btn = form.querySelector('button[type=submit]');
+    btn.disabled = true;
+    try {
+      const supabase = await getSupabase();
+      const { error } = await supabase.auth.updateUser({ password: pw });
+      if (error) throw error;
+      toast('Password updated', 'success');
+      go(home());
+    } catch (err) {
+      errEl.textContent = err.message || 'Could not update your password';
     } finally {
       btn.disabled = false;
     }
@@ -180,7 +304,7 @@ async function handleSession(session) {
       console.error(err);
       toast('Could not load your profile', 'error');
     }
-    if (!wasSignedIn && location.hash.startsWith('#/auth')) return go('#/dashboard');
+    if (!wasSignedIn && location.hash.startsWith('#/auth') && location.hash !== '#/auth/reset') return go(home());
   } else {
     clearState();
     if (wasSignedIn) return go('#/');
@@ -193,6 +317,15 @@ async function boot() {
     const open = $('.nav-links').classList.toggle('open');
     $('#nav-toggle').setAttribute('aria-expanded', String(open));
   });
+  // Read auth-email redirect details before supabase-js consumes the URL.
+  //   ?auth=recovery            → came from a password-reset email
+  //   #error=...&error_description=... → the email link was invalid or expired
+  const params = new URLSearchParams(location.search);
+  const isRecovery = params.get('auth') === 'recovery';
+  const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
+  const linkError = hashParams.get('error_description') || (hashParams.get('error') ? 'This link is invalid or has expired.' : null);
+  if (linkError) history.replaceState(null, '', `${location.pathname}${location.search}#/auth/signin`);
+
   window.addEventListener('hashchange', router);
 
   let supabase;
@@ -211,11 +344,25 @@ async function boot() {
   const { data } = await supabase.auth.getSession();
   state.session = data.session;
   if (state.session) await loadProfile().catch((e) => console.error(e));
+  if (isRecovery) history.replaceState(null, '', `${location.pathname}#/auth/reset`);
   router();
+  if (linkError) {
+    const errEl = $('#auth-error');
+    if (errEl) errEl.textContent = `${linkError.replace(/\.?\s*$/, '.')} Request a new email below.`;
+    else toast(linkError, 'error');
+  }
 
   // Per Supabase guidance, avoid awaiting Supabase calls directly inside this callback.
   supabase.auth.onAuthStateChange((event, session) => {
     if (event === 'INITIAL_SESSION') return;
+    if (event === 'PASSWORD_RECOVERY') {
+      setTimeout(async () => {
+        state.session = session;
+        await loadProfile().catch((e) => console.error(e));
+        go('#/auth/reset');
+      }, 0);
+      return;
+    }
     if (event === 'TOKEN_REFRESHED') {
       state.session = session;
       return;
