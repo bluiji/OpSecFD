@@ -7,7 +7,6 @@
   "engines": { "node": ">=18" },
   "scripts": {
     "build:schema": "node scripts/build-schema.mjs",
-    "dev": "vercel dev",
     "test": "node --test tests/*.test.js"
   },
   "dependencies": {
